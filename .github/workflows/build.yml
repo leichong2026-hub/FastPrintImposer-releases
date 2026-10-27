@@ -1,0 +1,118 @@
+# 在这个公开仓库里打包快印拼版助手 V2（公开仓库的 GitHub Actions 不限时间、不收费）。
+# 源代码在私有仓库 leichong2026-hub/FastPrintImposer：打包时用只读密钥 SOURCE_TOKEN 临时取下来，打完就随机器销毁，
+# 不会存进这个仓库。打好的安装包作为这次运行的附件（Artifacts）；勾“发布”时直接发布到本仓库的 Releases，
+# 店里电脑打开软件会提示更新（latest.json 就在这里）。
+# 只有有本仓库写权限的人能点“Run workflow”；别人发的合并请求（fork）拿不到密钥，也不会触发这里。
+name: Build FastPrintImposer V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '源代码分支（私有仓库里的分支名，正式版用 main）'
+        type: string
+        default: main
+      publish:
+        description: '发布给店里电脑（店里电脑会提示更新）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    env:
+      PYTHONUTF8: '1'
+      FASTPRINT_NO_AUTO_UPDATE: '1'
+      FASTPRINT_DEFAULT_VIEW: pro
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check source token
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: if (-not $env:SOURCE_TOKEN) { throw '没有设置密钥 SOURCE_TOKEN（只读取私有源代码），请按说明在 Settings → Secrets and variables → Actions 里添加。' }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: leichong2026-hub/FastPrintImposer
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.8.10'
+          architecture: x64
+      - name: Validate version
+        run: python tools/prepare_v2_build.py
+      - name: Install locked dependencies
+        run: |
+          python -m pip install pip==24.3.1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -r requirements-win7.txt -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows tests (TkDND required, no skips)
+        run: python tools/run_windows_tests.py
+      - name: Python 3.8 syntax check
+        run: python tools/check_py38.py
+      - name: Fetch and verify Source Han Sans SC fonts
+        run: python tools/fetch_v2_fonts.py
+      - name: Build V2 executable
+        run: python -m PyInstaller --noconfirm --clean FastPrintImposerV2.spec
+      - name: Packaged PDF and GUI smoke tests
+        run: python tools/check_packaged_v2.py dist/FastPrintImposerV2/FastPrintImposerV2.exe build/v2/portable-smoke.json
+      - name: Compile current-user installer
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (!(Test-Path $compiler)) { throw 'Windows image is missing Inno Setup 6' }
+          & $compiler installer/FastPrintImposerV2.iss | Tee-Object -Variable compilerOutput
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $versionMatch = [regex]::Match(($compilerOutput -join "`n"), 'Compiler engine version: Inno Setup ([0-9.]+)')
+          if (!$versionMatch.Success) { throw 'Cannot determine Inno Setup compiler version' }
+          $versionMatch.Groups[1].Value | Set-Content -Encoding utf8 build/v2/inno-version.txt
+      - name: Install and verify installed executable
+        run: |
+          $installer = @(Get-ChildItem installer-output/*.exe)
+          if ($installer.Count -ne 1) { throw 'Expected one installer' }
+          $destination = Join-Path $env:RUNNER_TEMP 'FPI installed QA'
+          $process = Start-Process -FilePath $installer[0].FullName -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/DIR="' + $destination + '"')) -PassThru
+          if (!$process.WaitForExit(120000)) { $process.Kill(); throw 'Installer timed out' }
+          if ($process.ExitCode -ne 0) { throw "Installer failed: $($process.ExitCode)" }
+          python tools/check_packaged_v2.py "$destination/FastPrintImposerV2.exe" build/v2/installed-smoke.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Record SHA256 and build provenance
+        run: python tools/record_v2_artifact.py
+      - name: Capture UI screenshots
+        continue-on-error: true
+        run: python tools/capture_v2_screenshots.py dist/FastPrintImposerV2/FastPrintImposerV2.exe build/v2/screenshots
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        continue-on-error: true
+        with:
+          name: FastPrintImposerV2-screenshots-${{ github.run_number }}
+          path: build/v2/screenshots/
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: FastPrintImposerV2-windows-x64-${{ github.run_number }}
+          path: |
+            installer-output/*.exe
+            installer-output/SHA256.txt
+            installer-output/latest.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+      - name: Publish update for shop computers
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/publish_release.py
